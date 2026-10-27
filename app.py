@@ -1,4 +1,8 @@
+import base64
+import binascii
 import ipaddress
+import hashlib
+import hmac
 import resource
 import json
 import os
@@ -13,7 +17,7 @@ from urllib.parse import urlparse, urljoin
 from html.parser import HTMLParser
 
 import requests
-from flask import Flask, jsonify, render_template_string, request, send_file
+from flask import Flask, jsonify, render_template_string, request, send_file, session, redirect, url_for
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from werkzeug.exceptions import TooManyRequests
@@ -24,7 +28,14 @@ from gtts import gTTS
 from pydub import AudioSegment
 
 app = Flask(__name__)
-app.config['MAX_CONTENT_LENGTH'] = 45 * 1024 * 1024
+# Secret derives from Render APP_PASSWORD; it is never sent to the client.
+_password = os.getenv('APP_PASSWORD', '')
+if not _password:
+    raise RuntimeError('APP_PASSWORD must be configured in Render Environment before starting V5.0')
+app.secret_key = hashlib.sha256(('KhmerDramaAIStudioV5/session/v1:' + _password).encode('utf-8')).digest()
+app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SECURE=True,
+                  SESSION_COOKIE_SAMESITE='Lax', PERMANENT_SESSION_LIFETIME=12 * 60 * 60,
+                  MAX_CONTENT_LENGTH=45 * 1024 * 1024)
 limiter = Limiter(get_remote_address, app=app, default_limits=['20 per hour'], storage_uri='memory://', headers_enabled=True)
 MAX_SECONDS = 90
 MAX_DOWNLOAD_BYTES = 40 * 1024 * 1024
@@ -34,7 +45,7 @@ FALLBACK_MODEL = os.getenv('GEMINI_FALLBACK_MODEL', '').strip()
 RETRY_DELAYS = (3, 7)  # bounded retries for temporary Gemini 503 only
 LANGUAGES = {'auto': 'Automatically identify the spoken language', 'en': 'English', 'zh': 'Mandarin Chinese', 'ko': 'Korean', 'ja': 'Japanese', 'th': 'Thai', 'vi': 'Vietnamese', 'fr': 'French', 'es': 'Spanish'}
 
-PAGE = '''<!doctype html><html lang="km"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Khmer Drama AI Studio V4.9</title><style>body{margin:0;padding:20px;background:#0b1220;color:#eaf0ff;font:15px Arial,sans-serif}main{max-width:850px;margin:auto}section{background:#1c273a;padding:22px;margin:16px 0;border-radius:16px}h1{font-size:28px}label{display:block;margin:14px 0 6px}input,select,textarea,button{font:inherit;padding:11px;border-radius:8px;box-sizing:border-box}input[type=url],input[type=text],select,textarea{width:100%;background:#0d1728;color:#fff;border:1px solid #50617d}input[type=number]{width:100px;background:#0d1728;color:#fff;border:1px solid #50617d}button{background:#7558e8;color:white;border:0;cursor:pointer;font-weight:bold}button:disabled{opacity:.5}.hint{color:#a9b9d3;font-size:13px;line-height:1.5}.grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}.error{color:#ffb5b5}a{color:#b7c8ff}#status{white-space:pre-wrap;line-height:1.5}</style></head><body><main><h1>🎬 Khmer Drama AI Studio V4.9</h1><p>Multi-language → Khmer · Free Edition · Authorized downloads only</p><section><h2>1. Video source</h2><label>Upload MP4 episodes (up to 5 files)</label><input id="files" type="file" accept="video/mp4" multiple><p class="hint">Name files 001.mp4, 002.mp4, etc. Upload OR URL; do not use both.</p><label>OR public YouTube / TikTok / Facebook link, authorized MP4, or episode page</label><input id="url" type="url" placeholder="https://your-authorized-host.com/episode.mp4"><p class="hint">Public YouTube, ordinary TikTok videos and Facebook links are attempted with yt-dlp where permitted. TikTok Short Drama episode pages are currently unsupported; use an authorized MP4 upload. Hongguo and other Chinese drama sites are recognized but require an explicitly offered downloadable MP4 link. No VIP, DRM, login, cookies or paywall bypass. Not all links will work. Only process videos you have permission to use.</p><label><input id="permission" type="checkbox"> I have permission to download and translate this video.</label><div class="grid"><div><label>From episode</label><input id="start" type="number" min="1" value="1"></div><div><label>To episode</label><input id="end" type="number" min="1" value="1"></div></div><p class="hint">For uploads, episode numbers correspond to sorted filenames. URL mode accepts one MP4 episode only.</p></section><section><h2>2. Translation & voices</h2><label>Original spoken language</label><select id="language"><option value="auto">Auto detect</option><option value="en">English</option><option value="zh">Chinese / Mandarin</option><option value="ko">Korean</option><option value="ja">Japanese</option><option value="th">Thai</option><option value="vi">Vietnamese</option><option value="fr">French</option><option value="es">Spanish</option></select><label>Target language</label><input type="text" value="Khmer (ភាសាខ្មែរ)" readonly><div class="grid"><div><label>Male voice (estimated)</label><select id="male"><option value="low">Lower pitch</option><option value="normal">Normal pitch</option></select></div><div><label>Female voice (estimated)</label><select id="female"><option value="high">Higher pitch</option><option value="normal">Normal pitch</option></select></div></div><p class="hint">Speaker and gender classification are estimates. Free Khmer gTTS voice with pitch adjustments. No Gemini TTS quota used. Gender estimation can be wrong; no voice cloning, emotion control, or visual lip-sync.</p></section><section><h2>3. Translate, dub & export</h2><button id="go" onclick="run()">Download (if URL) + Translate + Khmer Dub</button><p id="status" role="status"></p><div id="results"></div><p class="hint">Each episode: maximum 90 seconds. Processing may fail on free hosting due to quotas, timeout or memory.</p></section></main><script>
+PAGE = '''<!doctype html><html lang="km"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Khmer Drama AI Studio V5.1</title><style>body{margin:0;padding:20px;background:#0b1220;color:#eaf0ff;font:15px Arial,sans-serif}main{max-width:850px;margin:auto}section{background:#1c273a;padding:22px;margin:16px 0;border-radius:16px}h1{font-size:28px}label{display:block;margin:14px 0 6px}input,select,textarea,button{font:inherit;padding:11px;border-radius:8px;box-sizing:border-box}input[type=url],input[type=text],select,textarea{width:100%;background:#0d1728;color:#fff;border:1px solid #50617d}input[type=number]{width:100px;background:#0d1728;color:#fff;border:1px solid #50617d}button{background:#7558e8;color:white;border:0;cursor:pointer;font-weight:bold}button:disabled{opacity:.5}.hint{color:#a9b9d3;font-size:13px;line-height:1.5}.grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}.error{color:#ffb5b5}a{color:#b7c8ff}#status{white-space:pre-wrap;line-height:1.5}</style></head><body><main><h1>🎬 Khmer Drama AI Studio V5.1</h1><p>Multi-language → Khmer · Free Edition · Authorized downloads only</p><form method="post" action="/logout"><button type="submit" style="background:#34445d">Log out</button></form><section><h2>1. Video source</h2><label>Upload MP4 episodes (up to 5 files)</label><input id="files" type="file" accept="video/mp4" multiple><p class="hint">Name files 001.mp4, 002.mp4, etc. Upload OR URL; do not use both.</p><label>OR public YouTube / TikTok / Facebook link, authorized MP4, or episode page</label><input id="url" type="url" placeholder="https://your-authorized-host.com/episode.mp4"><p class="hint">Public YouTube, ordinary TikTok videos and Facebook links are attempted with yt-dlp where permitted. TikTok Short Drama episode pages are attempted with the bundled crawler; TikTok may require a valid authorized session configured privately by the owner, so some links cannot be downloaded. Hongguo and other Chinese drama sites are recognized but require an explicitly offered downloadable MP4 link. No VIP, DRM, login, cookies or paywall bypass. Not all links will work. Only process videos you have permission to use.</p><label><input id="permission" type="checkbox"> I have permission to download and translate this video.</label><div class="grid"><div><label>From episode</label><input id="start" type="number" min="1" value="1"></div><div><label>To episode</label><input id="end" type="number" min="1" value="1"></div></div><p class="hint">For uploads, episode numbers correspond to sorted filenames. URL mode accepts one MP4 episode only.</p></section><section><h2>2. Translation & voices</h2><label>Original spoken language</label><select id="language"><option value="auto">Auto detect</option><option value="en">English</option><option value="zh">Chinese / Mandarin</option><option value="ko">Korean</option><option value="ja">Japanese</option><option value="th">Thai</option><option value="vi">Vietnamese</option><option value="fr">French</option><option value="es">Spanish</option></select><label>Target language</label><input type="text" value="Khmer (ភាសាខ្មែរ)" readonly><div class="grid"><div><label>Male voice (estimated)</label><select id="male"><option value="low">Lower pitch</option><option value="normal">Normal pitch</option></select></div><div><label>Female voice (estimated)</label><select id="female"><option value="high">Higher pitch</option><option value="normal">Normal pitch</option></select></div></div><p class="hint">Speaker and gender classification are estimates. Free Khmer gTTS voice with pitch adjustments. No Gemini TTS quota used. Gender estimation can be wrong; no voice cloning, emotion control, or visual lip-sync.</p></section><section><h2>3. Translate, dub & export</h2><button id="go" onclick="run()">Download (if URL) + Translate + Khmer Dub</button><p id="status" role="status"></p><div id="results"></div><p class="hint">Each episode: maximum 90 seconds. Processing may fail on free hosting due to quotas, timeout or memory.</p></section></main><script>
 async function run(){const files=[...document.getElementById('files').files].sort((a,b)=>a.name.localeCompare(b.name,undefined,{numeric:true}));const url=document.getElementById('url').value.trim();const start=Number(document.getElementById('start').value),end=Number(document.getElementById('end').value);const status=document.getElementById('status'),out=document.getElementById('results'),btn=document.getElementById('go');out.replaceChildren();if(!Number.isInteger(start)||!Number.isInteger(end)||start<1||end<start||end-start+1>5){status.textContent='Select 1–5 episodes in a valid range.';return}if((files.length>0)===(url.length>0)){status.textContent='Provide MP4 uploads OR one authorized URL.';return}if(files.length&&files.length<end){status.textContent='Not enough uploaded episodes for selected range.';return}if(url&&(start!==1||end!==1)){status.textContent='URL import supports one episode only (1 to 1).';return}if(!document.getElementById('permission').checked){status.textContent='Please confirm that you have permission to use this video.';return}btn.disabled=true;try{for(let i=start;i<=end;i++){status.textContent='Processing episode '+i+'... This can take several minutes.';const fd=new FormData();if(files.length)fd.append('video',files[i-1]);else fd.append('url',url);fd.append('authorized','yes');fd.append('language',document.getElementById('language').value);fd.append('male',document.getElementById('male').value);fd.append('female',document.getElementById('female').value);const response=await fetch('/process',{method:'POST',body:fd});if(!response.ok){let err=await response.text();try{err=JSON.parse(err).error||err}catch{}if(response.status===429){const wait=response.headers.get('Retry-After');err+=' Please wait'+(wait?' '+wait+' seconds':'')+' before retrying.'}throw Error('Episode '+i+': '+err)}const blob=await response.blob(),href=URL.createObjectURL(blob),a=document.createElement('a');a.href=href;a.download='khmer_episode_'+String(i).padStart(3,'0')+'.zip';a.textContent='⬇ Download episode '+i+' (MP4 + SRT + JSON)';a.style.display='block';a.style.margin='10px 0';out.append(a)}status.textContent='Finished. Use the download links below.'}catch(e){status.textContent='Error: '+e.message;status.className='error'}finally{btn.disabled=false}}
 </script></body></html>'''
 
@@ -150,7 +161,29 @@ def download_shortdrama_with_crawler(url, dest):
         raise ValueError('TikTok Crawler binary missing. Deploy using the bundled Dockerfile.')
     # Strip URL query parameters; only the canonical episode URL is required.
     canonical = 'https://www.tiktok.com' + parsed.path
-    command = [binary, '-output', str(dest), '-quality', '720p', canonical]
+    command = [binary, '-output', str(dest), '-quality', '720p']
+    # Optional owner-supplied TikTok session. Never pass cookies in argv, logs,
+    # source code, or HTTP requests. The file is temporary and mode 0600.
+    cookie_data = os.getenv('TIKTOK_COOKIES_B64', '').strip()
+    if cookie_data:
+        if len(cookie_data) > 131072:
+            raise ValueError('TikTok session configuration is too large')
+        try:
+            cookie_bytes = base64.b64decode(cookie_data, validate=True)
+        except (binascii.Error, ValueError):
+            raise ValueError('Invalid TIKTOK_COOKIES_B64 encoding in Render Environment')
+        if not cookie_bytes or len(cookie_bytes) > 98304:
+            raise ValueError('TikTok session configuration has an invalid size')
+        cookie_path = dest.parent / '.tiktok_session.txt'
+        fd = os.open(str(cookie_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            with os.fdopen(fd, 'wb') as secret_file:
+                secret_file.write(cookie_bytes)
+        except Exception:
+            cookie_path.unlink(missing_ok=True)
+            raise
+        command.extend(['-cookies-file', str(cookie_path)])
+    command.append(canonical)
     def limit_child():
         resource.setrlimit(resource.RLIMIT_FSIZE, (MAX_DOWNLOAD_BYTES, MAX_DOWNLOAD_BYTES))
     try:
@@ -159,8 +192,9 @@ def download_shortdrama_with_crawler(url, dest):
     except subprocess.TimeoutExpired:
         raise ValueError('TikTok Crawler timed out. The episode may be unavailable from Render.')
     if result.returncode:
-        details = (result.stderr or result.stdout).strip()[-350:]
-        raise ValueError('TikTok Crawler could not download this episode: ' + details)
+        # Crawler stderr can contain signed URLs, request headers or cookies.
+        # Never send raw crawler output to the browser or Render logs.
+        raise ValueError('TikTok Crawler could not download this episode. Check whether your TikTok session is valid and the episode is available; Render network restrictions may also apply.')
     if not dest.is_file() or dest.stat().st_size == 0:
         raise ValueError('TikTok Crawler did not produce an MP4. Check Render logs.')
     if dest.stat().st_size > MAX_DOWNLOAD_BYTES:
@@ -351,6 +385,51 @@ def dub_audio(segments, folder, length, male, female):
     return path
 
 
+LOGIN_PAGE = '''<!doctype html><html lang="km"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Khmer Drama AI Studio — Sign in</title><style>body{background:#0b1220;color:#eaf0ff;font:16px Arial,sans-serif;min-height:100vh;display:grid;place-items:center;margin:0}.card{background:#1c273a;padding:32px;border-radius:16px;width:min(380px,85vw)}input,button{box-sizing:border-box;width:100%;padding:13px;border-radius:8px;font:inherit}input{background:#0d1728;color:white;border:1px solid #50617d}button{margin-top:14px;border:0;background:#7558e8;color:white;font-weight:bold;cursor:pointer}.error{color:#ffb5b5}</style></head><body><div class="card"><h2>🎬 Khmer Drama AI Studio V5.1</h2><p>Private access · Enter your app password</p><form method="post" action="/login"><label for="password">Password</label><input id="password" name="password" type="password" autocomplete="current-password" required autofocus><button type="submit">Sign in</button></form>ERROR_MESSAGE</div></body></html>'''
+
+
+@app.before_request
+def require_authentication():
+    # Every app endpoint, including API processing and health status, is private.
+    if request.endpoint in ('login', 'static'):
+        return None
+    if session.get('authenticated') is True:
+        return None
+    if request.path == '/process' or request.method != 'GET':
+        return jsonify(error='Sign in required. Open the app home page first.'), 401
+    return redirect(url_for('login'))
+
+
+@app.route('/login', methods=['GET', 'POST'])
+@limiter.limit('5 per minute; 20 per hour')
+def login():
+    if request.method == 'POST':
+        candidate = request.form.get('password', '')
+        if hmac.compare_digest(candidate.encode('utf-8'), _password.encode('utf-8')):
+            session.clear()
+            session.permanent = True
+            session['authenticated'] = True
+            response = redirect(url_for('home'))
+            response.headers['Cache-Control'] = 'no-store'
+            return response
+        message = '<p class="error">Incorrect password. Please try again.</p>'
+    else:
+        if session.get('authenticated'):
+            return redirect(url_for('home'))
+        message = ''
+    response = app.make_response(render_template_string(LOGIN_PAGE.replace('ERROR_MESSAGE', message)))
+    response.headers['Cache-Control'] = 'no-store'
+    return response
+
+
+@app.post('/logout')
+def logout():
+    session.clear()
+    response = redirect(url_for('login'))
+    response.headers['Cache-Control'] = 'no-store'
+    return response
+
+
 @app.errorhandler(429)
 def rate_limited(error):
     return jsonify(error='Too many requests. Please wait before trying again. Successful jobs are limited to 5 per hour; other requests have a separate safety limit.'), 429
@@ -363,7 +442,7 @@ def home():
 
 @app.get('/health')
 def health():
-    return jsonify(status='ok', version='4.9', translation_model=MODEL, fallback_model=FALLBACK_MODEL or None, tts_engine='gTTS Khmer (free, online)', gemini_key_configured=bool(os.getenv('GEMINI_API_KEY')))
+    return jsonify(status='ok', version='5.1', translation_model=MODEL, fallback_model=FALLBACK_MODEL or None, tts_engine='gTTS Khmer (free, online)', gemini_key_configured=bool(os.getenv('GEMINI_API_KEY')))
 
 
 @app.post('/process')
