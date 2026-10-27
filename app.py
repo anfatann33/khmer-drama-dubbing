@@ -1,4 +1,5 @@
 import ipaddress
+import resource
 import json
 import os
 import re
@@ -17,6 +18,7 @@ from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from werkzeug.exceptions import TooManyRequests
 from google import genai
+from google.genai import errors as genai_errors
 from google.genai import types
 from gtts import gTTS
 from pydub import AudioSegment
@@ -26,11 +28,14 @@ app.config['MAX_CONTENT_LENGTH'] = 45 * 1024 * 1024
 limiter = Limiter(get_remote_address, app=app, default_limits=['20 per hour'], storage_uri='memory://', headers_enabled=True)
 MAX_SECONDS = 90
 MAX_DOWNLOAD_BYTES = 40 * 1024 * 1024
-MODEL = os.getenv('GEMINI_MODEL', 'gemini-3.8-flash')
+SUPPORTED_PLATFORMS = {"youtube.com": "YouTube", "youtu.be": "YouTube", "tiktok.com": "TikTok", "facebook.com": "Facebook", "fb.watch": "Facebook"}
+MODEL = os.getenv('GEMINI_MODEL', 'gemini-2.5-flash')
+FALLBACK_MODEL = os.getenv('GEMINI_FALLBACK_MODEL', '').strip()
+RETRY_DELAYS = (3, 7)  # bounded retries for temporary Gemini 503 only
 LANGUAGES = {'auto': 'Automatically identify the spoken language', 'en': 'English', 'zh': 'Mandarin Chinese', 'ko': 'Korean', 'ja': 'Japanese', 'th': 'Thai', 'vi': 'Vietnamese', 'fr': 'French', 'es': 'Spanish'}
 
-PAGE = '''<!doctype html><html lang="km"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Khmer Drama AI Studio V4.2</title><style>body{margin:0;padding:20px;background:#0b1220;color:#eaf0ff;font:15px Arial,sans-serif}main{max-width:850px;margin:auto}section{background:#1c273a;padding:22px;margin:16px 0;border-radius:16px}h1{font-size:28px}label{display:block;margin:14px 0 6px}input,select,textarea,button{font:inherit;padding:11px;border-radius:8px;box-sizing:border-box}input[type=url],input[type=text],select,textarea{width:100%;background:#0d1728;color:#fff;border:1px solid #50617d}input[type=number]{width:100px;background:#0d1728;color:#fff;border:1px solid #50617d}button{background:#7558e8;color:white;border:0;cursor:pointer;font-weight:bold}button:disabled{opacity:.5}.hint{color:#a9b9d3;font-size:13px;line-height:1.5}.grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}.error{color:#ffb5b5}a{color:#b7c8ff}#status{white-space:pre-wrap;line-height:1.5}</style></head><body><main><h1>🎬 Khmer Drama AI Studio V4.2</h1><p>Multi-language → Khmer · Free Edition · Authorized downloads only</p><section><h2>1. Video source</h2><label>Upload MP4 episodes (up to 5 files)</label><input id="files" type="file" accept="video/mp4" multiple><p class="hint">Name files 001.mp4, 002.mp4, etc. Upload OR URL; do not use both.</p><label>OR authorized HTTPS MP4 URL / episode page URL</label><input id="url" type="url" placeholder="https://your-authorized-host.com/episode.mp4"><p class="hint">MP4 URLs are supported. For allowlisted episode pages, V4.2 checks only clearly published download links; it does not extract player streams, cookies, VIP or DRM. Configure ALLOWED_PAGE_HOSTS and ALLOWED_VIDEO_HOSTS.</p><div class="grid"><div><label>From episode</label><input id="start" type="number" min="1" value="1"></div><div><label>To episode</label><input id="end" type="number" min="1" value="1"></div></div><p class="hint">For uploads, episode numbers correspond to sorted filenames. URL mode accepts one MP4 episode only.</p></section><section><h2>2. Translation & voices</h2><label>Original spoken language</label><select id="language"><option value="auto">Auto detect</option><option value="en">English</option><option value="zh">Chinese / Mandarin</option><option value="ko">Korean</option><option value="ja">Japanese</option><option value="th">Thai</option><option value="vi">Vietnamese</option><option value="fr">French</option><option value="es">Spanish</option></select><label>Target language</label><input type="text" value="Khmer (ភាសាខ្មែរ)" readonly><div class="grid"><div><label>Male voice (estimated)</label><select id="male"><option value="low">Lower pitch</option><option value="normal">Normal pitch</option></select></div><div><label>Female voice (estimated)</label><select id="female"><option value="high">Higher pitch</option><option value="normal">Normal pitch</option></select></div></div><p class="hint">Speaker and gender classification are estimates. Free Khmer gTTS voice with pitch adjustments. No Gemini TTS quota used. Gender estimation can be wrong; no voice cloning, emotion control, or visual lip-sync.</p></section><section><h2>3. Translate, dub & export</h2><button id="go" onclick="run()">Download (if URL) + Translate + Khmer Dub</button><p id="status" role="status"></p><div id="results"></div><p class="hint">Each episode: maximum 90 seconds. Processing may fail on free hosting due to quotas, timeout or memory.</p></section></main><script>
-async function run(){const files=[...document.getElementById('files').files].sort((a,b)=>a.name.localeCompare(b.name,undefined,{numeric:true}));const url=document.getElementById('url').value.trim();const start=Number(document.getElementById('start').value),end=Number(document.getElementById('end').value);const status=document.getElementById('status'),out=document.getElementById('results'),btn=document.getElementById('go');out.replaceChildren();if(!Number.isInteger(start)||!Number.isInteger(end)||start<1||end<start||end-start+1>5){status.textContent='Select 1–5 episodes in a valid range.';return}if((files.length>0)===(url.length>0)){status.textContent='Provide MP4 uploads OR one authorized URL.';return}if(files.length&&files.length<end){status.textContent='Not enough uploaded episodes for selected range.';return}if(url&&(start!==1||end!==1)){status.textContent='URL import supports one episode only (1 to 1).';return}btn.disabled=true;try{for(let i=start;i<=end;i++){status.textContent='Processing episode '+i+'... This can take several minutes.';const fd=new FormData();if(files.length)fd.append('video',files[i-1]);else fd.append('url',url);fd.append('language',document.getElementById('language').value);fd.append('male',document.getElementById('male').value);fd.append('female',document.getElementById('female').value);const response=await fetch('/process',{method:'POST',body:fd});if(!response.ok){let err=await response.text();try{err=JSON.parse(err).error||err}catch{}if(response.status===429){const wait=response.headers.get('Retry-After');err+=' Please wait'+(wait?' '+wait+' seconds':'')+' before retrying.'}throw Error('Episode '+i+': '+err)}const blob=await response.blob(),href=URL.createObjectURL(blob),a=document.createElement('a');a.href=href;a.download='khmer_episode_'+String(i).padStart(3,'0')+'.zip';a.textContent='⬇ Download episode '+i+' (MP4 + SRT + JSON)';a.style.display='block';a.style.margin='10px 0';out.append(a)}status.textContent='Finished. Use the download links below.'}catch(e){status.textContent='Error: '+e.message;status.className='error'}finally{btn.disabled=false}}
+PAGE = '''<!doctype html><html lang="km"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Khmer Drama AI Studio V4.7</title><style>body{margin:0;padding:20px;background:#0b1220;color:#eaf0ff;font:15px Arial,sans-serif}main{max-width:850px;margin:auto}section{background:#1c273a;padding:22px;margin:16px 0;border-radius:16px}h1{font-size:28px}label{display:block;margin:14px 0 6px}input,select,textarea,button{font:inherit;padding:11px;border-radius:8px;box-sizing:border-box}input[type=url],input[type=text],select,textarea{width:100%;background:#0d1728;color:#fff;border:1px solid #50617d}input[type=number]{width:100px;background:#0d1728;color:#fff;border:1px solid #50617d}button{background:#7558e8;color:white;border:0;cursor:pointer;font-weight:bold}button:disabled{opacity:.5}.hint{color:#a9b9d3;font-size:13px;line-height:1.5}.grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}.error{color:#ffb5b5}a{color:#b7c8ff}#status{white-space:pre-wrap;line-height:1.5}</style></head><body><main><h1>🎬 Khmer Drama AI Studio V4.7</h1><p>Multi-language → Khmer · Free Edition · Authorized downloads only</p><section><h2>1. Video source</h2><label>Upload MP4 episodes (up to 5 files)</label><input id="files" type="file" accept="video/mp4" multiple><p class="hint">Name files 001.mp4, 002.mp4, etc. Upload OR URL; do not use both.</p><label>OR public YouTube / TikTok / Facebook link, authorized MP4, or episode page</label><input id="url" type="url" placeholder="https://your-authorized-host.com/episode.mp4"><p class="hint">Public YouTube, TikTok and Facebook links are attempted with yt-dlp where permitted. Hongguo and other Chinese drama sites are recognized but require an explicitly offered downloadable MP4 link. No VIP, DRM, login, cookies or paywall bypass. Not all links will work. Only process videos you have permission to use.</p><label><input id="permission" type="checkbox"> I have permission to download and translate this video.</label><div class="grid"><div><label>From episode</label><input id="start" type="number" min="1" value="1"></div><div><label>To episode</label><input id="end" type="number" min="1" value="1"></div></div><p class="hint">For uploads, episode numbers correspond to sorted filenames. URL mode accepts one MP4 episode only.</p></section><section><h2>2. Translation & voices</h2><label>Original spoken language</label><select id="language"><option value="auto">Auto detect</option><option value="en">English</option><option value="zh">Chinese / Mandarin</option><option value="ko">Korean</option><option value="ja">Japanese</option><option value="th">Thai</option><option value="vi">Vietnamese</option><option value="fr">French</option><option value="es">Spanish</option></select><label>Target language</label><input type="text" value="Khmer (ភាសាខ្មែរ)" readonly><div class="grid"><div><label>Male voice (estimated)</label><select id="male"><option value="low">Lower pitch</option><option value="normal">Normal pitch</option></select></div><div><label>Female voice (estimated)</label><select id="female"><option value="high">Higher pitch</option><option value="normal">Normal pitch</option></select></div></div><p class="hint">Speaker and gender classification are estimates. Free Khmer gTTS voice with pitch adjustments. No Gemini TTS quota used. Gender estimation can be wrong; no voice cloning, emotion control, or visual lip-sync.</p></section><section><h2>3. Translate, dub & export</h2><button id="go" onclick="run()">Download (if URL) + Translate + Khmer Dub</button><p id="status" role="status"></p><div id="results"></div><p class="hint">Each episode: maximum 90 seconds. Processing may fail on free hosting due to quotas, timeout or memory.</p></section></main><script>
+async function run(){const files=[...document.getElementById('files').files].sort((a,b)=>a.name.localeCompare(b.name,undefined,{numeric:true}));const url=document.getElementById('url').value.trim();const start=Number(document.getElementById('start').value),end=Number(document.getElementById('end').value);const status=document.getElementById('status'),out=document.getElementById('results'),btn=document.getElementById('go');out.replaceChildren();if(!Number.isInteger(start)||!Number.isInteger(end)||start<1||end<start||end-start+1>5){status.textContent='Select 1–5 episodes in a valid range.';return}if((files.length>0)===(url.length>0)){status.textContent='Provide MP4 uploads OR one authorized URL.';return}if(files.length&&files.length<end){status.textContent='Not enough uploaded episodes for selected range.';return}if(url&&(start!==1||end!==1)){status.textContent='URL import supports one episode only (1 to 1).';return}if(!document.getElementById('permission').checked){status.textContent='Please confirm that you have permission to use this video.';return}btn.disabled=true;try{for(let i=start;i<=end;i++){status.textContent='Processing episode '+i+'... This can take several minutes.';const fd=new FormData();if(files.length)fd.append('video',files[i-1]);else fd.append('url',url);fd.append('authorized','yes');fd.append('language',document.getElementById('language').value);fd.append('male',document.getElementById('male').value);fd.append('female',document.getElementById('female').value);const response=await fetch('/process',{method:'POST',body:fd});if(!response.ok){let err=await response.text();try{err=JSON.parse(err).error||err}catch{}if(response.status===429){const wait=response.headers.get('Retry-After');err+=' Please wait'+(wait?' '+wait+' seconds':'')+' before retrying.'}throw Error('Episode '+i+': '+err)}const blob=await response.blob(),href=URL.createObjectURL(blob),a=document.createElement('a');a.href=href;a.download='khmer_episode_'+String(i).padStart(3,'0')+'.zip';a.textContent='⬇ Download episode '+i+' (MP4 + SRT + JSON)';a.style.display='block';a.style.margin='10px 0';out.append(a)}status.textContent='Finished. Use the download links below.'}catch(e){status.textContent='Error: '+e.message;status.className='error'}finally{btn.disabled=false}}
 </script></body></html>'''
 
 
@@ -122,6 +127,57 @@ def allowed_url(url):
     return p
 
 
+def platform_name(url):
+    """Only enable known, public platform extractors; never a generic arbitrary URL."""
+    parsed = urlparse(url)
+    if parsed.scheme != 'https' or not parsed.hostname or parsed.username or parsed.password or parsed.port not in (None, 443):
+        raise ValueError('A public HTTPS video URL is required')
+    host = parsed.hostname.lower().rstrip('.')
+    for domain, name in SUPPORTED_PLATFORMS.items():
+        if host == domain or host.endswith('.' + domain):
+            check_public_host(host)
+            return name
+    return None
+
+
+def download_platform_video(url, dest):
+    """Public, unprotected videos only; no cookies, credentials or generic extractors."""
+    name = platform_name(url)
+    if not name:
+        raise ValueError('Not a supported public video platform')
+    folder = dest.parent
+    template = str(folder / 'platform.%(ext)s')
+    command = ['yt-dlp', '--no-playlist', '--no-config', '--no-cache-dir',
+               '--no-check-certificates' if False else '--no-warnings',
+               '--socket-timeout', '15', '--retries', '1', '--fragment-retries', '1',
+               '--max-filesize', '40M', '--match-filter', 'duration <= 90',
+               '--format', 'best[ext=mp4][height<=720]/best[height<=720]/best',
+               '--merge-output-format', 'mp4', '--output', template,
+               '--', url]
+    def limit_child():
+        resource.setrlimit(resource.RLIMIT_FSIZE, (MAX_DOWNLOAD_BYTES, MAX_DOWNLOAD_BYTES))
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=110,
+                                preexec_fn=limit_child, cwd=str(folder))
+    except subprocess.TimeoutExpired:
+        raise ValueError(f'{name}: Download timed out. Try a shorter public video.')
+    if result.returncode:
+        msg = (result.stderr or result.stdout)[-500:]
+        raise ValueError(f'{name}: Cannot download this video. It may require login, be restricted, or be unsupported. {msg}')
+    candidates = [x for x in folder.glob('platform.*') if x.suffix.lower() in ('.mp4', '.mkv', '.webm')]
+    if len(candidates) != 1:
+        raise ValueError(f'{name}: No single downloadable video was produced')
+    candidate = candidates[0]
+    if candidate.stat().st_size > MAX_DOWNLOAD_BYTES:
+        raise ValueError('Video exceeds 40 MB limit')
+    if candidate.suffix.lower() == '.mp4':
+        candidate.rename(dest)
+    else:
+        run_cmd('ffmpeg', '-y', '-i', str(candidate), '-c:v', 'libx264', '-preset', 'ultrafast', '-c:a', 'aac', str(dest), timeout=110)
+    if dest.stat().st_size > MAX_DOWNLOAD_BYTES:
+        raise ValueError('Converted video exceeds 40 MB limit')
+
+
 def download_mp4(url, dest):
     allowed_url(url)
     with requests.get(url, stream=True, timeout=(8, 25), allow_redirects=False, headers={'User-Agent': 'KhmerDramaAIStudioV4/1.0'}) as response:
@@ -144,6 +200,40 @@ def download_mp4(url, dest):
                 output.write(chunk)
 
 
+def generate_with_503_retry(client, upload, prompt):
+    """Retry temporary 503 errors; optionally try a user-configured fallback model.
+
+    No retry for 429 quota/rate-limit, authentication, invalid model or bad request.
+    """
+    models = [MODEL]
+    if FALLBACK_MODEL and FALLBACK_MODEL != MODEL:
+        models.append(FALLBACK_MODEL)
+    for index, model in enumerate(models):
+        for attempt in range(len(RETRY_DELAYS) + 1):
+            try:
+                return client.models.generate_content(
+                    model=model,
+                    contents=[upload, prompt],
+                    config=types.GenerateContentConfig(response_mime_type='application/json'),
+                )
+            except genai_errors.APIError as exc:
+                code = getattr(exc, 'code', None)
+                if code == 429:
+                    raise RuntimeError('Gemini quota/rate limit (429). Wait for quota reset; automatic retry disabled.') from exc
+                if code != 503:
+                    raise RuntimeError(f'Gemini API error {code}: verify model access, key and API settings in Render logs.') from exc
+                if attempt < len(RETRY_DELAYS):
+                    delay = RETRY_DELAYS[attempt]
+                    app.logger.warning('Gemini 503 on model %s; retrying after %ss (attempt %s)', model, delay, attempt + 1)
+                    time.sleep(delay)
+                else:
+                    app.logger.warning('Gemini 503 persisted on model %s', model)
+                    if index == len(models) - 1:
+                        raise RuntimeError('Gemini 503: model is overloaded after retries. Try again later or configure GEMINI_FALLBACK_MODEL with an available compatible model.') from exc
+                    app.logger.warning('Trying configured fallback model %s', models[index + 1])
+    raise RuntimeError('No Gemini model was available')
+
+
 def translate_audio(client, audio_path, length, language):
     upload = client.files.upload(file=str(audio_path))
     try:
@@ -162,7 +252,7 @@ def translate_audio(client, audio_path, length, language):
                   'Identify speakers as speaker_1, speaker_2, etc. Estimate speaker gender from voice only as male/female/unknown, acknowledging uncertainty. '
                   'Return ONLY a JSON array, each item having start (seconds), end (seconds), speaker, gender, khmer. '
                   f'Timestamps must be relative to the audio, between 0 and {length:.2f} seconds. Keep each item short. Do not invent dialogue.')
-        response = client.models.generate_content(model=MODEL, contents=[upload, prompt], config=types.GenerateContentConfig(response_mime_type='application/json'))
+        response = generate_with_503_retry(client, upload, prompt)
         try:
             parsed = json.loads(response.text)
         except (TypeError, ValueError):
@@ -241,7 +331,7 @@ def home():
 
 @app.get('/health')
 def health():
-    return jsonify(status='ok', version='4.2', translation_model=MODEL, tts_engine='gTTS Khmer (free, online)', gemini_key_configured=bool(os.getenv('GEMINI_API_KEY')))
+    return jsonify(status='ok', version='4.6', translation_model=MODEL, fallback_model=FALLBACK_MODEL or None, tts_engine='gTTS Khmer (free, online)', gemini_key_configured=bool(os.getenv('GEMINI_API_KEY')))
 
 
 @app.post('/process')
@@ -250,6 +340,8 @@ def process():
     try:
         if not os.getenv('GEMINI_API_KEY'):
             return jsonify(error='Missing GEMINI_API_KEY in Render Environment'), 500
+        if request.form.get('authorized') != 'yes':
+            return jsonify(error='Confirm that you have permission to use this video'), 400
         upload = request.files.get('video')
         url = request.form.get('url', '').strip()
         if bool(upload and upload.filename) == bool(url):
@@ -265,9 +357,12 @@ def process():
             folder = Path(temporary)
             video = folder / 'input.mp4'
             if url:
-                if not urlparse(url).path.lower().endswith('.mp4'):
-                    url = resolve_authorized_page(url)
-                download_mp4(url, video)
+                if platform_name(url):
+                    download_platform_video(url, video)
+                else:
+                    if not urlparse(url).path.lower().endswith('.mp4'):
+                        url = resolve_authorized_page(url)
+                    download_mp4(url, video)
             else:
                 if not upload.filename.lower().endswith('.mp4'):
                     return jsonify(error='Only MP4 uploads supported'), 400

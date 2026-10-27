@@ -4,3 +4,4 @@ google-genai>=1.0,<2
 gTTS>=2.5,<3
 pydub>=0.25,<1
 gunicorn>=22,<24
+yt-dlp>=2025.1
