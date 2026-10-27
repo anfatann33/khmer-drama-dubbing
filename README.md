@@ -1,28 +1,25 @@
-# Khmer Drama AI Studio V4.1 (Free-first)
+# Khmer Drama AI Studio V4.2 — Authorized Episode Page Import
 
-Flask + Gemini translation + free gTTS Khmer speech + FFmpeg.
+Based on V4.1. This is a conservative, **explicit download-link-only** page resolver; it does not scrape video players, decode HLS, use browser cookies, bypass DRM or unlock VIP episodes.
 
-## Render Docker deployment
+## Deploy
+Replace root `app.py`, `requirements.txt`, `Dockerfile`, and `README.md` in your existing GitHub repo; commit; Render redeploys.
 
-Replace the existing repository root files `app.py`, `requirements.txt`, `Dockerfile` with these files. Commit. Render Docker service deploys latest commit.
+## Render Environment
+- `GEMINI_API_KEY` — existing secret; never share it.
+- `GEMINI_MODEL` — a verified `generateContent` model ID accessible to your key (not a Live-only model).
+- `ALLOWED_VIDEO_HOSTS` — comma-separated **exact HTTPS hostnames** serving MP4 files with download permission (example: `cdn.yourdomain.com`).
+- `ALLOWED_PAGE_HOSTS` — comma-separated **exact HTTPS hostnames** of episode pages you are permitted to import (example: `episodes.yourdomain.com`).
 
-Environment variables:
-- `GEMINI_API_KEY`: secret key from Google AI Studio (required).
-- `GEMINI_MODEL`: `gemini-3.8-flash` **only if** your API key can call that exact model via the standard `generateContent` API. The app defaults to this name, but availability and free quota vary. If you get a 404, inspect your actual available model IDs and choose a compatible text/multimodal generateContent model.
-- `ALLOWED_VIDEO_HOSTS`: optional comma-separated exact public HTTPS hosts you control or are authorized to download from. Without this, direct URL import is disabled. MP4 upload still works.
+No wildcard hosts. No host is allowed by default. The page resolver follows no redirects, limits HTML to 512 KB, blocks private IPs, and only accepts an `<a download href="...mp4">` or `<a rel="download" href="...mp4">` link whose target host is explicitly in `ALLOWED_VIDEO_HOSTS`. A page with multiple qualifying links must be handled using a single direct MP4 URL. Do not add hosts unless you are authorized to download from them.
 
-## Supported
-- MP4 uploads (up to five), or one direct authorized HTTPS MP4 URL, not a webpage or DRM stream.
-- Auto language recognition or select English/Chinese/Korean/Thai/Japanese/Vietnamese/French/Spanish.
-- Gemini translates spoken audio into timestamped Khmer transcript.
-- gTTS (`km`) generates Khmer speech; pitch adjustment for estimated male/female speaker. **gTTS is an external network service and can fail or throttle.**
-- Download ZIP with MP4, SRT and JSON.
+## Capabilities and limitations
+- One direct MP4 or authorized page URL per job; 1–5 MP4 file uploads. URL mode is one episode only.
+- Gemini translates source audio into Khmer timestamps. gTTS synthesizes Khmer (network service, variable quality/availability). Pitch adjustment approximates male/female voices.
+- MP4 + SRT + JSON output, maximum 90 seconds per episode; MP4 URL maximum 40 MB.
+- **Hongguo player URLs do not have a known explicit authorized MP4 download link**. This feature does not make Hongguo import work automatically. Playback is not download permission.
+- No true face-based lip sync, no voice cloning, no guaranteed production reliability on Render Free.
+- Test with a legally downloadable public MP4 and an HTML page explicitly offering that MP4 for download.
 
-## Not supported
-- No Hongguo player page scraping, no VIP/DRM bypass, no direct video-page downloading, no batch URL episode discovery.
-- No real mouth lip-sync, no reliable speaker-to-face matching, no guaranteed emotion or voice quality, no background music separation.
-- Render Free may run out of memory or timeout. Max 90 seconds and 40 MB direct download per video. No guaranteed end-to-end reliability; integration testing with your Gemini account is required.
-
-## Check
-Visit `/health` to confirm deployed version, model and API key presence (not the key itself).
-Start with one 10-20 second MP4 in English or Mandarin. Never paste your API key in screenshots.
+## Diagnostics
+`/health` displays the deployed version, selected model, and whether a key is configured (not the key itself).

@@ -8,7 +8,8 @@ import tempfile
 import time
 import zipfile
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
+from html.parser import HTMLParser
 
 import requests
 from flask import Flask, jsonify, render_template_string, request, send_file
@@ -27,8 +28,8 @@ MAX_DOWNLOAD_BYTES = 40 * 1024 * 1024
 MODEL = os.getenv('GEMINI_MODEL', 'gemini-3.8-flash')
 LANGUAGES = {'auto': 'Automatically identify the spoken language', 'en': 'English', 'zh': 'Mandarin Chinese', 'ko': 'Korean', 'ja': 'Japanese', 'th': 'Thai', 'vi': 'Vietnamese', 'fr': 'French', 'es': 'Spanish'}
 
-PAGE = '''<!doctype html><html lang="km"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Khmer Drama AI Studio V4.1</title><style>body{margin:0;padding:20px;background:#0b1220;color:#eaf0ff;font:15px Arial,sans-serif}main{max-width:850px;margin:auto}section{background:#1c273a;padding:22px;margin:16px 0;border-radius:16px}h1{font-size:28px}label{display:block;margin:14px 0 6px}input,select,textarea,button{font:inherit;padding:11px;border-radius:8px;box-sizing:border-box}input[type=url],input[type=text],select,textarea{width:100%;background:#0d1728;color:#fff;border:1px solid #50617d}input[type=number]{width:100px;background:#0d1728;color:#fff;border:1px solid #50617d}button{background:#7558e8;color:white;border:0;cursor:pointer;font-weight:bold}button:disabled{opacity:.5}.hint{color:#a9b9d3;font-size:13px;line-height:1.5}.grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}.error{color:#ffb5b5}a{color:#b7c8ff}#status{white-space:pre-wrap;line-height:1.5}</style></head><body><main><h1>🎬 Khmer Drama AI Studio V4.1</h1><p>Multi-language → Khmer · Free Edition · Authorized downloads only</p><section><h2>1. Video source</h2><label>Upload MP4 episodes (up to 5 files)</label><input id="files" type="file" accept="video/mp4" multiple><p class="hint">Name files 001.mp4, 002.mp4, etc. Upload OR URL; do not use both.</p><label>OR direct public HTTPS MP4 URL</label><input id="url" type="url" placeholder="https://your-authorized-host.com/episode.mp4"><p class="hint">A video player page (such as Hongguo /player/...) is not a direct MP4. URLs require an operator-configured host allowlist. No VIP, DRM or login bypass.</p><div class="grid"><div><label>From episode</label><input id="start" type="number" min="1" value="1"></div><div><label>To episode</label><input id="end" type="number" min="1" value="1"></div></div><p class="hint">For uploads, episode numbers correspond to sorted filenames. URL mode accepts one MP4 episode only.</p></section><section><h2>2. Translation & voices</h2><label>Original spoken language</label><select id="language"><option value="auto">Auto detect</option><option value="en">English</option><option value="zh">Chinese / Mandarin</option><option value="ko">Korean</option><option value="ja">Japanese</option><option value="th">Thai</option><option value="vi">Vietnamese</option><option value="fr">French</option><option value="es">Spanish</option></select><label>Target language</label><input type="text" value="Khmer (ភាសាខ្មែរ)" readonly><div class="grid"><div><label>Male voice (estimated)</label><select id="male"><option value="low">Lower pitch</option><option value="normal">Normal pitch</option></select></div><div><label>Female voice (estimated)</label><select id="female"><option value="high">Higher pitch</option><option value="normal">Normal pitch</option></select></div></div><p class="hint">Speaker and gender classification are estimates. Free Khmer gTTS voice with pitch adjustments. No Gemini TTS quota used. Gender estimation can be wrong; no voice cloning, emotion control, or visual lip-sync.</p></section><section><h2>3. Translate, dub & export</h2><button id="go" onclick="run()">Download (if URL) + Translate + Khmer Dub</button><p id="status" role="status"></p><div id="results"></div><p class="hint">Each episode: maximum 90 seconds. Processing may fail on free hosting due to quotas, timeout or memory.</p></section></main><script>
-async function run(){const files=[...document.getElementById('files').files].sort((a,b)=>a.name.localeCompare(b.name,undefined,{numeric:true}));const url=document.getElementById('url').value.trim();const start=Number(document.getElementById('start').value),end=Number(document.getElementById('end').value);const status=document.getElementById('status'),out=document.getElementById('results'),btn=document.getElementById('go');out.replaceChildren();if(!Number.isInteger(start)||!Number.isInteger(end)||start<1||end<start||end-start+1>5){status.textContent='Select 1–5 episodes in a valid range.';return}if((files.length>0)===(url.length>0)){status.textContent='Provide MP4 uploads OR one direct MP4 URL.';return}if(files.length&&files.length<end){status.textContent='Not enough uploaded episodes for selected range.';return}if(url&&(start!==1||end!==1)){status.textContent='Direct URL supports one episode only (1 to 1).';return}btn.disabled=true;try{for(let i=start;i<=end;i++){status.textContent='Processing episode '+i+'... This can take several minutes.';const fd=new FormData();if(files.length)fd.append('video',files[i-1]);else fd.append('url',url);fd.append('language',document.getElementById('language').value);fd.append('male',document.getElementById('male').value);fd.append('female',document.getElementById('female').value);const response=await fetch('/process',{method:'POST',body:fd});if(!response.ok){let err=await response.text();try{err=JSON.parse(err).error||err}catch{}throw Error('Episode '+i+': '+err)}const blob=await response.blob(),href=URL.createObjectURL(blob),a=document.createElement('a');a.href=href;a.download='khmer_episode_'+String(i).padStart(3,'0')+'.zip';a.textContent='⬇ Download episode '+i+' (MP4 + SRT + JSON)';a.style.display='block';a.style.margin='10px 0';out.append(a)}status.textContent='Finished. Use the download links below.'}catch(e){status.textContent='Error: '+e.message;status.className='error'}finally{btn.disabled=false}}
+PAGE = '''<!doctype html><html lang="km"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Khmer Drama AI Studio V4.2</title><style>body{margin:0;padding:20px;background:#0b1220;color:#eaf0ff;font:15px Arial,sans-serif}main{max-width:850px;margin:auto}section{background:#1c273a;padding:22px;margin:16px 0;border-radius:16px}h1{font-size:28px}label{display:block;margin:14px 0 6px}input,select,textarea,button{font:inherit;padding:11px;border-radius:8px;box-sizing:border-box}input[type=url],input[type=text],select,textarea{width:100%;background:#0d1728;color:#fff;border:1px solid #50617d}input[type=number]{width:100px;background:#0d1728;color:#fff;border:1px solid #50617d}button{background:#7558e8;color:white;border:0;cursor:pointer;font-weight:bold}button:disabled{opacity:.5}.hint{color:#a9b9d3;font-size:13px;line-height:1.5}.grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}.error{color:#ffb5b5}a{color:#b7c8ff}#status{white-space:pre-wrap;line-height:1.5}</style></head><body><main><h1>🎬 Khmer Drama AI Studio V4.2</h1><p>Multi-language → Khmer · Free Edition · Authorized downloads only</p><section><h2>1. Video source</h2><label>Upload MP4 episodes (up to 5 files)</label><input id="files" type="file" accept="video/mp4" multiple><p class="hint">Name files 001.mp4, 002.mp4, etc. Upload OR URL; do not use both.</p><label>OR authorized HTTPS MP4 URL / episode page URL</label><input id="url" type="url" placeholder="https://your-authorized-host.com/episode.mp4"><p class="hint">MP4 URLs are supported. For allowlisted episode pages, V4.2 checks only clearly published download links; it does not extract player streams, cookies, VIP or DRM. Configure ALLOWED_PAGE_HOSTS and ALLOWED_VIDEO_HOSTS.</p><div class="grid"><div><label>From episode</label><input id="start" type="number" min="1" value="1"></div><div><label>To episode</label><input id="end" type="number" min="1" value="1"></div></div><p class="hint">For uploads, episode numbers correspond to sorted filenames. URL mode accepts one MP4 episode only.</p></section><section><h2>2. Translation & voices</h2><label>Original spoken language</label><select id="language"><option value="auto">Auto detect</option><option value="en">English</option><option value="zh">Chinese / Mandarin</option><option value="ko">Korean</option><option value="ja">Japanese</option><option value="th">Thai</option><option value="vi">Vietnamese</option><option value="fr">French</option><option value="es">Spanish</option></select><label>Target language</label><input type="text" value="Khmer (ភាសាខ្មែរ)" readonly><div class="grid"><div><label>Male voice (estimated)</label><select id="male"><option value="low">Lower pitch</option><option value="normal">Normal pitch</option></select></div><div><label>Female voice (estimated)</label><select id="female"><option value="high">Higher pitch</option><option value="normal">Normal pitch</option></select></div></div><p class="hint">Speaker and gender classification are estimates. Free Khmer gTTS voice with pitch adjustments. No Gemini TTS quota used. Gender estimation can be wrong; no voice cloning, emotion control, or visual lip-sync.</p></section><section><h2>3. Translate, dub & export</h2><button id="go" onclick="run()">Download (if URL) + Translate + Khmer Dub</button><p id="status" role="status"></p><div id="results"></div><p class="hint">Each episode: maximum 90 seconds. Processing may fail on free hosting due to quotas, timeout or memory.</p></section></main><script>
+async function run(){const files=[...document.getElementById('files').files].sort((a,b)=>a.name.localeCompare(b.name,undefined,{numeric:true}));const url=document.getElementById('url').value.trim();const start=Number(document.getElementById('start').value),end=Number(document.getElementById('end').value);const status=document.getElementById('status'),out=document.getElementById('results'),btn=document.getElementById('go');out.replaceChildren();if(!Number.isInteger(start)||!Number.isInteger(end)||start<1||end<start||end-start+1>5){status.textContent='Select 1–5 episodes in a valid range.';return}if((files.length>0)===(url.length>0)){status.textContent='Provide MP4 uploads OR one authorized URL.';return}if(files.length&&files.length<end){status.textContent='Not enough uploaded episodes for selected range.';return}if(url&&(start!==1||end!==1)){status.textContent='URL import supports one episode only (1 to 1).';return}btn.disabled=true;try{for(let i=start;i<=end;i++){status.textContent='Processing episode '+i+'... This can take several minutes.';const fd=new FormData();if(files.length)fd.append('video',files[i-1]);else fd.append('url',url);fd.append('language',document.getElementById('language').value);fd.append('male',document.getElementById('male').value);fd.append('female',document.getElementById('female').value);const response=await fetch('/process',{method:'POST',body:fd});if(!response.ok){let err=await response.text();try{err=JSON.parse(err).error||err}catch{}throw Error('Episode '+i+': '+err)}const blob=await response.blob(),href=URL.createObjectURL(blob),a=document.createElement('a');a.href=href;a.download='khmer_episode_'+String(i).padStart(3,'0')+'.zip';a.textContent='⬇ Download episode '+i+' (MP4 + SRT + JSON)';a.style.display='block';a.style.margin='10px 0';out.append(a)}status.textContent='Finished. Use the download links below.'}catch(e){status.textContent='Error: '+e.message;status.className='error'}finally{btn.disabled=false}}
 </script></body></html>'''
 
 
@@ -43,6 +44,70 @@ def video_duration(path):
     return float(run_cmd('ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=nw=1:nk=1', str(path), timeout=20).strip())
 
 
+class DownloadLinkParser(HTMLParser):
+    """Collect only explicit downloadable MP4 anchors, not player media streams."""
+    def __init__(self):
+        super().__init__()
+        self.links = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag.lower() != 'a':
+            return
+        attrs = dict(attrs)
+        href = attrs.get('href', '')
+        if not href:
+            return
+        # Require the page author to explicitly mark a link as downloadable.
+        rel = str(attrs.get('rel', '')).lower().split()
+        if 'download' in attrs or 'download' in rel:
+            self.links.append(href)
+
+
+def resolve_authorized_page(url):
+    """Return a public HTTPS MP4 URL explicitly marked for download on an allowed page."""
+    parsed = urlparse(url)
+    if parsed.scheme != 'https' or not parsed.hostname or parsed.username or parsed.password or parsed.port not in (None, 443):
+        raise ValueError('Episode page must be a public HTTPS URL on port 443')
+    page_hosts = {h.strip().lower() for h in os.getenv('ALLOWED_PAGE_HOSTS', '').split(',') if h.strip()}
+    if parsed.hostname.lower() not in page_hosts:
+        raise ValueError('Episode page host is not authorized. Configure ALLOWED_PAGE_HOSTS in Render.')
+    check_public_host(parsed.hostname)
+    with requests.get(url, timeout=(8, 15), stream=True, allow_redirects=False,
+                      headers={'User-Agent': 'KhmerDramaAIStudio/4.2'}) as response:
+        if response.status_code != 200:
+            raise ValueError(f'Episode page returned HTTP {response.status_code}; redirects are not followed')
+        if response.headers.get('Content-Type', '').split(';')[0].strip().lower() not in ('text/html', 'application/xhtml+xml'):
+            raise ValueError('Episode URL did not return an HTML page')
+        size = 0
+        chunks = []
+        for chunk in response.iter_content(chunk_size=16384):
+            size += len(chunk)
+            if size > 512 * 1024:
+                raise ValueError('Episode page exceeds 512 KB inspection limit')
+            chunks.append(chunk)
+    parser = DownloadLinkParser()
+    parser.feed(b''.join(chunks).decode('utf-8', errors='replace'))
+    valid = []
+    for href in parser.links[:30]:
+        candidate = urljoin(url, href)
+        try:
+            allowed_url(candidate)
+            valid.append(candidate)
+        except (ValueError, OSError):
+            continue
+    if len(valid) == 1:
+        return valid[0]
+    if len(valid) > 1:
+        raise ValueError('Multiple authorized MP4 downloads found; use one direct MP4 URL')
+    raise ValueError('No explicitly authorized MP4 download link found on this episode page. Playback alone is not a download permission.')
+
+
+def check_public_host(host):
+    ips = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+    if not ips or any(not ipaddress.ip_address(x[4][0]).is_global for x in ips):
+        raise ValueError('Private or reserved IP addresses are blocked')
+
+
 def allowed_url(url):
     p = urlparse(url)
     if p.scheme != 'https' or not p.hostname or p.username or p.password or p.port not in (None, 443):
@@ -52,9 +117,7 @@ def allowed_url(url):
     hosts = [x.strip().lower() for x in os.getenv('ALLOWED_VIDEO_HOSTS', '').split(',') if x.strip()]
     if p.hostname.lower() not in hosts:
         raise ValueError('Video host is not authorized. Add its exact hostname to ALLOWED_VIDEO_HOSTS in Render.')
-    ips = socket.getaddrinfo(p.hostname, 443, type=socket.SOCK_STREAM)
-    if not ips or any(not ipaddress.ip_address(x[4][0]).is_global for x in ips):
-        raise ValueError('Private or reserved IP addresses are blocked')
+    check_public_host(p.hostname)
     return p
 
 
@@ -172,7 +235,7 @@ def home():
 
 @app.get('/health')
 def health():
-    return jsonify(status='ok', version='4.1', translation_model=MODEL, tts_engine='gTTS Khmer (free, online)', gemini_key_configured=bool(os.getenv('GEMINI_API_KEY')))
+    return jsonify(status='ok', version='4.2', translation_model=MODEL, tts_engine='gTTS Khmer (free, online)', gemini_key_configured=bool(os.getenv('GEMINI_API_KEY')))
 
 
 @app.post('/process')
@@ -184,7 +247,7 @@ def process():
         upload = request.files.get('video')
         url = request.form.get('url', '').strip()
         if bool(upload and upload.filename) == bool(url):
-            return jsonify(error='Provide either an MP4 file or a direct MP4 URL'), 400
+            return jsonify(error='Provide either an MP4 file or one authorized URL'), 400
         language = request.form.get('language', 'auto')
         if language not in LANGUAGES:
             return jsonify(error='Unsupported language selection'), 400
@@ -196,6 +259,8 @@ def process():
             folder = Path(temporary)
             video = folder / 'input.mp4'
             if url:
+                if not urlparse(url).path.lower().endswith('.mp4'):
+                    url = resolve_authorized_page(url)
                 download_mp4(url, video)
             else:
                 if not upload.filename.lower().endswith('.mp4'):
