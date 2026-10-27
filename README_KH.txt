@@ -12,3 +12,5 @@ Khmer Drama AI Studio V5.1 (Private / Render Free)
 8. A working browser playback alone does not guarantee that server-side downloading is permitted or possible.
 9. Render Free is ephemeral. It may sleep and has limited resources. Test one <=90 second authorized episode first.
 10. V5.1 does not include automatic cookie extraction from your browser. Browser sessions must not be uploaded via public app forms.
+
+V5.2 SAFE DIAGNOSTICS: TikTok download errors now show only a fixed diagnostic code, never raw crawler output. Cookie configuration checked for valid Netscape TikTok entries and a nonempty msToken. No secrets are printed. Upload app.py to GitHub and let Render redeploy. This does not guarantee TikTok permits downloads.
