@@ -469,23 +469,27 @@ func runVideo(options options, cookie string, stdout, stderr io.Writer) error {
 func runShortDrama(options options, cookie string, stdout, stderr io.Writer) error {
 	client, err := shortdrama.NewClient(shortdrama.ClientOptions{Cookie: cookie, Headers: options.headers})
 	if err != nil {
-		return err
+		return fmt.Errorf("KD_STAGE_SESSION_INIT: %w", err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), videoRequestTimeout)
 	defer cancel()
 
 	result, err := client.Resolve(ctx, options.inputURL)
 	if err != nil {
-		return err
+		return fmt.Errorf("KD_STAGE_METADATA: %w", err)
 	}
 	if options.json {
 		return printJSON(stdout, result)
 	}
-	return downloadVideo(ctx, client.Session(), downloader.FileInfo{
+	err = downloadVideo(ctx, client.Session(), downloader.FileInfo{
 		Author:  result.Video.Author.UniqueID,
 		VideoID: result.Video.ID,
 		Referer: result.FinalURL,
 	}, result.Media, options, stdout, stderr)
+	if err != nil {
+		return fmt.Errorf("KD_STAGE_MEDIA: %w", err)
+	}
+	return nil
 }
 
 func runPhoto(options options, cookie string, stdout, stderr io.Writer) error {
